@@ -81,7 +81,10 @@ def load_existing_graph(client, throttler, batch_size=1000):
             inserted_vertex_ids.update(str(vid) for vid in vertex_ids)
             offset += batch_size
             vertex_progress.value = offset
-            vertex_label.value = f"Loaded {offset} vertices so far..."
+            elapsed = time.time() - throttler.window_start
+            est_total = (elapsed / offset * len(inserted_vertex_ids)) if offset else 0
+            remaining = est_total - elapsed if est_total > elapsed else 0
+            vertex_label.value = f"Loaded {offset} vertices so far... Estimated time left: {remaining:.1f}s"
             throttler.throttle(10)
         except Exception as e:
             logger.error(f"Failed to load vertices: {e}")
@@ -105,7 +108,10 @@ def load_existing_graph(client, throttler, batch_size=1000):
                 inserted_edge_keys.add(edge_key)
             offset += batch_size
             edge_progress.value = offset
-            edge_label.value = f"Loaded {offset} edges so far..."
+            elapsed = time.time() - throttler.window_start
+            est_total = (elapsed / offset * len(inserted_edge_keys)) if offset else 0
+            remaining = est_total - elapsed if est_total > elapsed else 0
+            edge_label.value = f"Loaded {offset} edges so far... Estimated time left: {remaining:.1f}s"
             throttler.throttle(10)
         except Exception as e:
             logger.error(f"Failed to load edges: {e}")
@@ -142,7 +148,10 @@ def upload_vertices(client, df_vertices, inserted_vertex_ids, throttler):
 
     for i, row in df_vertices.iterrows():
         progress.value += 1
-        progress_label.value = f"Inserting vertex {progress.value} / {len(df_vertices)}"
+        elapsed = time.time() - throttler.window_start
+        est_total = (elapsed / progress.value * len(df_vertices)) if progress.value else 0
+        remaining = est_total - elapsed if est_total > elapsed else 0
+        progress_label.value = f"Inserting vertex {progress.value} / {len(df_vertices)} - Est. time left: {remaining:.1f}s"
 
         vertex_id = str(row["ID"])
         label = str(row["Label"])
@@ -173,7 +182,10 @@ def upload_edges(client, df_edges, inserted_edge_keys, throttler):
 
     for i, row in df_edges.iterrows():
         progress.value += 1
-        progress_label.value = f"Inserting edge {progress.value} / {len(df_edges)}"
+        elapsed = time.time() - throttler.window_start
+        est_total = (elapsed / progress.value * len(df_edges)) if progress.value else 0
+        remaining = est_total - elapsed if est_total > elapsed else 0
+        progress_label.value = f"Inserting edge {progress.value} / {len(df_edges)} - Est. time left: {remaining:.1f}s"
 
         out_id = str(row["OutV"])
         in_id = str(row["InV"])
