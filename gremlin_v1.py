@@ -59,11 +59,16 @@ def escape_gremlin_str(s):
     return str(s).replace('\\', '\\\\').replace("'", "\\'")
 
 # --------------------------------------
-# Load Existing Vertices and Edges (Batched)
+# Load Existing Vertices and Edges (Batched with Progress)
 # --------------------------------------
 def load_existing_graph(client, throttler, batch_size=1000):
     inserted_vertex_ids = set()
     inserted_edge_keys = set()
+
+    print("Loading existing vertices...")
+    vertex_progress = IntProgress(min=0, description='Vertices:')
+    vertex_label = HTML()
+    display(VBox([vertex_label, vertex_progress]))
 
     offset = 0
     while True:
@@ -74,11 +79,18 @@ def load_existing_graph(client, throttler, batch_size=1000):
             if not vertex_ids:
                 break
             inserted_vertex_ids.update(str(vid) for vid in vertex_ids)
-            throttler.throttle(10)
             offset += batch_size
+            vertex_progress.value = offset
+            vertex_label.value = f"Loaded {offset} vertices so far..."
+            throttler.throttle(10)
         except Exception as e:
             logger.error(f"Failed to load vertices: {e}")
             break
+
+    print("Loading existing edges...")
+    edge_progress = IntProgress(min=0, description='Edges:')
+    edge_label = HTML()
+    display(VBox([edge_label, edge_progress]))
 
     offset = 0
     while True:
@@ -91,8 +103,10 @@ def load_existing_graph(client, throttler, batch_size=1000):
             for e in edges:
                 edge_key = f"{e['out']}-{e['label']}->{e['in']}"
                 inserted_edge_keys.add(edge_key)
-            throttler.throttle(10)
             offset += batch_size
+            edge_progress.value = offset
+            edge_label.value = f"Loaded {offset} edges so far..."
+            throttler.throttle(10)
         except Exception as e:
             logger.error(f"Failed to load edges: {e}")
             break
