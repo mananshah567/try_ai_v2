@@ -79,10 +79,11 @@ def load_existing_graph(client, throttler, batch_size=1000):
         try:
             result_set = client.submit(query)
             vertex_ids = result_set.all().result()
+            ru = result_set.status_attributes.get('x-ms-total-request-charge', 10.0)
             if not vertex_ids:
                 break
             inserted_vertex_ids.update(str(vid) for vid in vertex_ids)
-            throttler.throttle(10)
+            throttler.throttle(ru)
             offset += batch_size
 
             vertex_progress.value = min(offset, total_vertices)
@@ -115,12 +116,13 @@ def load_existing_graph(client, throttler, batch_size=1000):
         try:
             result_set = client.submit(query)
             edges = result_set.all().result()
+            ru = result_set.status_attributes.get('x-ms-total-request-charge', 10.0)
             if not edges:
                 break
             for e in edges:
                 edge_key = f"{e['out']}-{e['label']}->{e['in']}"
                 inserted_edge_keys.add(edge_key)
-            throttler.throttle(10)
+            throttler.throttle(ru)
             offset += batch_size
 
             edge_progress.value = min(offset, total_edges)
@@ -178,8 +180,9 @@ def upload_vertices(client, df_vertices, inserted_vertex_ids, throttler):
         try:
             result_set = client.submit(query)
             result_set.all().result()
+            ru = result_set.status_attributes.get('x-ms-total-request-charge', 10.0)
             inserted_vertex_ids.add(vertex_id)
-            throttler.throttle(10)
+            throttler.throttle(ru)
         except GremlinServerError as e:
             logger.error(f"Vertex error {vertex_id}: {e}")
 
@@ -222,8 +225,9 @@ def upload_edges(client, df_edges, inserted_edge_keys, throttler):
         try:
             result_set = client.submit(query)
             result_set.all().result()
+            ru = result_set.status_attributes.get('x-ms-total-request-charge', 10.0)
             inserted_edge_keys.add(edge_id)
-            throttler.throttle(10)
+            throttler.throttle(ru)
         except GremlinServerError as e:
             logger.error(f"Edge error {edge_id}: {e}")
 
@@ -242,7 +246,8 @@ def delete_vertices_by_ids(client, vertex_ids, throttler):
             query = f"g.V('{vid}').drop()"
             result_set = client.submit(query)
             result_set.all().result()
-            throttler.throttle(10)
+            ru = result_set.status_attributes.get('x-ms-total-request-charge', 10.0)
+            throttler.throttle(ru)
         except Exception as e:
             logger.error(f"Failed to delete vertex {vid}: {e}")
 
@@ -255,7 +260,8 @@ def delete_edges_by_ids(client, edge_ids, throttler):
             query = f"g.E('{eid}').drop()"
             result_set = client.submit(query)
             result_set.all().result()
-            throttler.throttle(10)
+            ru = result_set.status_attributes.get('x-ms-total-request-charge', 10.0)
+            throttler.throttle(ru)
         except Exception as e:
             logger.error(f"Failed to delete edge {eid}: {e}")
 
@@ -274,7 +280,8 @@ def delete_all_vertices_batched(client, throttler, batch_size=1000):
             query = f"g.V().limit({batch_size}).drop()"
             result_set = client.submit(query)
             result_set.all().result()
-            throttler.throttle(10)
+            ru = result_set.status_attributes.get('x-ms-total-request-charge', 10.0)
+            throttler.throttle(ru)
             total_deleted += batch_size
             progress.value = total_deleted
             progress_label.value = f"Deleted {total_deleted} vertices so far..."
@@ -302,7 +309,8 @@ def delete_all_edges_batched(client, throttler, batch_size=1000):
             query = f"g.E().limit({batch_size}).drop()"
             result_set = client.submit(query)
             result_set.all().result()
-            throttler.throttle(10)
+            ru = result_set.status_attributes.get('x-ms-total-request-charge', 10.0)
+            throttler.throttle(ru)
             total_deleted += batch_size
             progress.value = total_deleted
             progress_label.value = f"Deleted {total_deleted} edges so far..."
