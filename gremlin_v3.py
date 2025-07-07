@@ -331,3 +331,23 @@ def clear_graph(client, throttler):
     delete_all_edges_batched(client, throttler)
     delete_all_vertices_batched(client, throttler)
     print("Graph cleared.")
+
+# --------------------------------------
+# Run Upload Process
+# --------------------------------------
+def run_graph_upload(df_vertices, df_edges):
+    throttler = RUThrottler(RU_LIMIT_PER_SECOND)
+    inserted_vertex_ids, inserted_edge_keys = load_existing_graph(client, throttler)
+
+    upload_vertices(client, df_vertices, inserted_vertex_ids, throttler)
+    upload_edges(client, df_edges, inserted_edge_keys, throttler)
+
+    client.close()
+
+# --------------------------------------
+# Run Clear Process
+# --------------------------------------
+def run_graph_clear():
+    throttler = RUThrottler(RU_LIMIT_PER_SECOND)
+    clear_graph(client, throttler)
+    client.close()
