@@ -53,13 +53,30 @@ def escape_gremlin_str(s):
     return str(s).replace('\\', '\\\\').replace("'", "\\'")
 
 # --------------------------------------
+# Vertex Property Handlers
+# --------------------------------------
+def add_person_properties(row, query):
+    return query + f".property('person name', '{escape_gremlin_str(row['name'])}')"
+
+def add_school_properties(row, query):
+    return query + f".property('school name', '{escape_gremlin_str(row['name'])}')"
+
+def add_company_properties(row, query):
+    return query + f".property('company name', '{escape_gremlin_str(row['name'])}')"
+
+ENTITY_PROPERTY_DISPATCHER = {
+    'person': add_person_properties,
+    'school': add_school_properties,
+    'company': add_company_properties,
+}
+
+# --------------------------------------
 # Load Existing Vertices and Edges in Batches (with Progress)
 # --------------------------------------
 def load_existing_graph(client, throttler, batch_size=1000):
     inserted_vertex_ids = set()
     inserted_edge_keys = set()
 
-    # Load vertices
     print("Loading existing vertices...")
     try:
         count_query = "g.V().count()"
@@ -96,7 +113,6 @@ def load_existing_graph(client, throttler, batch_size=1000):
             logger.error(f"Failed to load vertices: {e}")
             break
 
-    # Load edges
     print("Loading existing edges...")
     try:
         count_query = "g.E().count()"
@@ -137,24 +153,6 @@ def load_existing_graph(client, throttler, batch_size=1000):
 
     print("Finished loading existing graph.")
     return inserted_vertex_ids, inserted_edge_keys
-
-# --------------------------------------
-# Vertex Property Handlers
-# --------------------------------------
-def add_person_properties(row, query):
-    return query + f".property('person name', '{escape_gremlin_str(row['name'])}')"
-
-def add_school_properties(row, query):
-    return query + f".property('school name', '{escape_gremlin_str(row['name'])}')"
-
-def add_company_properties(row, query):
-    return query + f".property('company name', '{escape_gremlin_str(row['name'])}')"
-
-ENTITY_PROPERTY_DISPATCHER = {
-    'person': add_person_properties,
-    'school': add_school_properties,
-    'company': add_company_properties,
-}
 
 # --------------------------------------
 # Upload Vertices
