@@ -4,7 +4,6 @@ from gremlin_python.driver.client import Client
 from ipywidgets import IntProgress, HTML, VBox
 from IPython.display import display
 
-
 def chunked(iterable, size):
     """Yield successive `size`-sized chunks from `iterable`."""
     it = iter(iterable)
@@ -64,9 +63,12 @@ def upload_vertices_with_existence_check(
         processed += len(batch)
         bar.value = processed
         elapsed = time.time() - start
+        rate = processed / elapsed if elapsed else 0
+        eta = (total - processed) / rate if rate else float('inf')
         label.value = (
             f"Processed {processed}/{total} vertices, "
-            f"Inserted {uploaded}, elapsed {elapsed:.1f}s"
+            f"Inserted {uploaded}, "
+            f"Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
         )
 
     return uploaded
@@ -126,9 +128,12 @@ def upload_edges_with_existence_check(
         processed += len(batch)
         bar.value = processed
         elapsed = time.time() - start
+        rate = processed / elapsed if elapsed else 0
+        eta = (total - processed) / rate if rate else float('inf')
         label.value = (
             f"Processed {processed}/{total} edges, "
-            f"Inserted {uploaded}, elapsed {elapsed:.1f}s"
+            f"Inserted {uploaded}, "
+            f"Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
         )
 
     return uploaded
