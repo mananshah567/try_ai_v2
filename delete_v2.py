@@ -1,6 +1,7 @@
 import time
 from itertools import islice
 from gremlin_python.driver.client import Client
+from gremlin_python.driver.protocol import GremlinServerError
 from ipywidgets import IntProgress, HTML, VBox
 from IPython.display import display
 
@@ -38,24 +39,31 @@ def delete_vertices_in_batches(
     start = time.time()
 
     for batch in chunked(vertex_ids, batch_size):
+        # build drop statements
         statements = [f"g.V('{vid}').drop()" for vid in batch]
-        gremlin = "; ".join(statements)
-        rs = client.submit(gremlin)
-        attrs = rs.status_attributes
-        ru = float(attrs.get('x-ms-total-request-charge', 10.0))
-        throttler.throttle(ru)
+        drop_script = "; ".join(statements)
 
-        batch_count = len(batch)
-        deleted += batch_count
-        processed += batch_count
-
-        bar.value = processed
-        elapsed = time.time() - start
-        rate = processed / elapsed if elapsed else 0
-        eta = (total - processed) / rate if rate else float('inf')
-        label.value = (
-            f"Deleted {deleted}/{total} vertices, Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
-        )
+        try:
+            rs = client.submit(drop_script)
+            # ensure execution
+            rs.all().result()
+            attrs = rs.status_attributes
+            ru = float(attrs.get('x-ms-total-request-charge', 10.0))
+            throttler.throttle(ru)
+        except GremlinServerError as e:
+            print(f"Failed dropping vertices {batch}: {e}")
+        else:
+            batch_count = len(batch)
+            deleted += batch_count
+            processed += batch_count
+            # update progress bar and ETA
+            bar.value = processed
+            elapsed = time.time() - start
+            rate = processed / elapsed if elapsed else 0
+            eta = (total - processed) / rate if rate else float('inf')
+            label.value = (
+                f"Deleted {deleted}/{total} vertices, Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
+            )
 
     return deleted
 
@@ -85,23 +93,27 @@ def delete_edges_in_batches(
 
     for batch in chunked(edge_ids, batch_size):
         statements = [f"g.E('{eid}').drop()" for eid in batch]
-        gremlin = "; ".join(statements)
-        rs = client.submit(gremlin)
-        attrs = rs.status_attributes
-        ru = float(attrs.get('x-ms-total-request-charge', 10.0))
-        throttler.throttle(ru)
+        drop_script = "; ".join(statements)
 
-        batch_count = len(batch)
-        deleted += batch_count
-        processed += batch_count
-
-        bar.value = processed
-        elapsed = time.time() - start
-        rate = processed / elapsed if elapsed else 0
-        eta = (total - processed) / rate if rate else float('inf')
-        label.value = (
-            f"Deleted {deleted}/{total} edges, Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
-        )
+        try:
+            rs = client.submit(drop_script)
+            rs.all().result()
+            attrs = rs.status_attributes
+            ru = float(attrs.get('x-ms-total-request-charge', 10.0))
+            throttler.throttle(ru)
+        except GremlinServerError as e:
+            print(f"Failed dropping edges {batch}: {e}")
+        else:
+            batch_count = len(batch)
+            deleted += batch_count
+            processed += batch_count
+            bar.value = processed
+            elapsed = time.time() - start
+            rate = processed / elapsed if elapsed else 0
+            eta = (total - processed) / rate if rate else float('inf')
+            label.value = (
+                f"Deleted {deleted}/{total} edges, Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
+            )
 
     return deleted
 
@@ -127,14 +139,13 @@ def delete_all_edges_in_batches(
     if total is not None:
         bar = IntProgress(min=0, max=total, description="Edges:")
     else:
-        bar = IntProgress(min=0, description="Edges:")  # indeterminate max
+        bar = IntProgress(min=0, description="Edges:")
     display(VBox([label, bar]))
 
     deleted = 0
     start = time.time()
 
     while True:
-        # fetch a batch of edge IDs
         rs = client.submit(f"g.E().limit({batch_size}).id()")
         attrs = rs.status_attributes
         ru = float(attrs.get('x-ms-total-request-charge', 10.0))
@@ -144,22 +155,25 @@ def delete_all_edges_in_batches(
         if not edge_ids:
             break
 
-        # drop them
         drop_script = "; ".join(f"g.E('{eid}').drop()" for eid in edge_ids)
-        rs2 = client.submit(drop_script)
-        attrs2 = rs2.status_attributes
-        ru2 = float(attrs2.get('x-ms-total-request-charge', 10.0))
-        throttler.throttle(ru2)
-
-        deleted += len(edge_ids)
-        bar.value = deleted
-        elapsed = time.time() - start
-        if total:
-            rate = deleted / elapsed if elapsed else 0
-            eta = (total - deleted) / rate if rate else float('inf')
-            label.value = f"Deleted {deleted}/{total} edges, Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
+        try:
+            rs2 = client.submit(drop_script)
+            rs2.all().result()
+            attrs2 = rs2.status_attributes
+            ru2 = float(attrs2.get('x-ms-total-request-charge', 10.0))
+            throttler.throttle(ru2)
+        except GremlinServerError as e:
+            print(f"Failed dropping batch of edges {edge_ids}: {e}")
         else:
-            label.value = f"Deleted {deleted} edges, Elapsed {elapsed:.1f}s"
+            deleted += len(edge_ids)
+            bar.value = deleted
+            elapsed = time.time() - start
+            if total:
+                rate = deleted / elapsed if elapsed else 0
+                eta = (total - deleted) / rate if rate else float('inf')
+                label.value = f"Deleted {deleted}/{total} edges, Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
+            else:
+                label.value = f"Deleted {deleted} edges, Elapsed {elapsed:.1f}s"
 
     return deleted
 
@@ -177,7 +191,6 @@ def delete_all_vertices_in_batches(
     """
     # First delete edges to avoid dangling references
     total_vertices = None
-    # Attempt to get total vertex count
     try:
         total_vertices = client.submit("g.V().count()", {}).all().result()[0]
     except Exception:
@@ -193,7 +206,6 @@ def delete_all_vertices_in_batches(
     deleted = 0
     start = time.time()
 
-    # delete all edges first
     delete_all_edges_in_batches(client, throttler, batch_size)
 
     while True:
@@ -207,19 +219,23 @@ def delete_all_vertices_in_batches(
             break
 
         drop_script = "; ".join(f"g.V('{vid}').drop()" for vid in vertex_ids)
-        rs2 = client.submit(drop_script)
-        attrs2 = rs2.status_attributes
-        ru2 = float(attrs2.get('x-ms-total-request-charge', 10.0))
-        throttler.throttle(ru2)
-
-        deleted += len(vertex_ids)
-        v_bar.value = deleted
-        elapsed = time.time() - start
-        if total_vertices:
-            rate = deleted / elapsed if elapsed else 0
-            eta = (total_vertices - deleted) / rate if rate else float('inf')
-            v_label.value = f"Deleted {deleted}/{total_vertices} vertices, Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
+        try:
+            rs2 = client.submit(drop_script)
+            rs2.all().result()
+            attrs2 = rs2.status_attributes
+            ru2 = float(attrs2.get('x-ms-total-request-charge', 10.0))
+            throttler.throttle(ru2)
+        except GremlinServerError as e:
+            print(f"Failed dropping batch of vertices {vertex_ids}: {e}")
         else:
-            v_label.value = f"Deleted {deleted} vertices, Elapsed {elapsed:.1f}s"
+            deleted += len(vertex_ids)
+            v_bar.value = deleted
+            elapsed = time.time() - start
+            if total_vertices:
+                rate = deleted / elapsed if elapsed else 0
+                eta = (total_vertices - deleted) / rate if rate else float('inf')
+                v_label.value = f"Deleted {deleted}/{total_vertices} vertices, Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
+            else:
+                v_label.value = f"Deleted {deleted} vertices, Elapsed {elapsed:.1f}s"
 
     return deleted
