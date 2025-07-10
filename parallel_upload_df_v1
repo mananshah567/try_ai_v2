@@ -1,0 +1,209 @@
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import islice
+import pandas as pd
+from gremlin_python.driver.client import Client
+from gremlin_python.driver.protocol import GremlinServerError
+from ipywidgets import IntProgress, HTML, VBox
+from IPython.display import display
+
+# Utility to chunk an iterable
+
+def chunked(iterable, size):
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, size))
+        if not batch:
+            return
+        yield batch
+
+
+def parallel_upload_vertices(
+    client: Client,
+    throttler,
+    vertices,
+    inserted_vertex_ids: set,
+    dispatcher: dict,
+    batch_size: int = 100,
+    workers: int = 4,
+    max_retries: int = 3,
+    backoff_base: float = 1.0
+) -> set:
+    """
+    Parallel upload of new vertices with retry/backoff on rate limits or timeouts.
+
+    - `vertices`: pandas.DataFrame or list of dicts with 'ID','label', and optional property columns.
+    - `inserted_vertex_ids`: set tracking existing IDs.
+    - `dispatcher`: map from label to function(row, base_query)->str for property steps.
+    """
+    # Normalize input
+    if isinstance(vertices, pd.DataFrame):
+        rows = list(vertices.itertuples(index=False, name='Row'))
+        def vid(x): return str(getattr(x, 'ID')).strip()
+        def lbl(x): return str(getattr(x, 'label')).strip()
+    else:
+        rows = list(vertices)
+        def vid(x): return x['id']
+        def lbl(x): return x['label']
+
+    # Filter out already-inserted
+    to_upload = [r for r in rows if vid(r) not in inserted_vertex_ids]
+    total = len(to_upload)
+
+    # Progress UI
+    label = HTML()
+    bar = IntProgress(min=0, max=total, description="Vertices:")
+    display(VBox([label, bar]))
+
+    uploaded = 0
+    lock = threading.Lock()
+    start = time.time()
+
+    def _upload_batch(batch):
+        nonlocal uploaded
+        count = 0
+        # Build Gremlin scripts
+        statements = []
+        for row in batch:
+            id_val = vid(row)
+            lbl_val = lbl(row)
+            base_q = f"g.addV('{lbl_val}').property('id','{id_val}')"
+            prop_func = dispatcher.get(lbl_val)
+            q = prop_func(row, base_q) if prop_func else base_q
+            statements.append(q)
+
+        script = "; ".join(statements)
+        for attempt in range(max_retries):
+            try:
+                rs = client.submit(script)
+                rs.all().result()
+                throttler.throttle(float(rs.status_attributes.get('x-ms-total-request-charge', 10.0)))
+                count = len(batch)
+                break
+            except GremlinServerError as e:
+                msg = str(e)
+                if '429' in msg or 'TooManyRequests' in msg or 'GraphTimeoutException' in msg:
+                    time.sleep(backoff_base * (2 ** attempt))
+                    continue
+                else:
+                    print(f"Vertex upload failed for {[vid(r) for r in batch][:3]}: {e}")
+                    break
+
+        with lock:
+            for row in batch[:count]:
+                inserted_vertex_ids.add(vid(row))
+            uploaded += count
+            bar.value = uploaded
+            elapsed = time.time() - start
+            rate = uploaded / elapsed if elapsed else 0
+            eta = (total - uploaded) / rate if rate else float('inf')
+            label.value = f"Uploaded {uploaded}/{total} vertices, Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
+        return count
+
+    # Dispatch in parallel
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_upload_batch, b) for b in chunked(to_upload, batch_size)]
+        for _ in as_completed(futures):
+            pass
+
+    return inserted_vertex_ids
+
+
+def parallel_upload_edges(
+    client: Client,
+    throttler,
+    edges,
+    inserted_edge_keys: set,
+    batch_size: int = 100,
+    workers: int = 4,
+    max_retries: int = 3,
+    backoff_base: float = 1.0
+) -> set:
+    """
+    Parallel batch-upload of new edges with retry/backoff on rate limits or timeouts.
+
+    - `edges`: pandas.DataFrame or list of dicts with 'source','target','edge_detail', and optional prop columns.
+    - `inserted_edge_keys`: set tracking composite keys.
+    """
+    # Normalize input
+    if isinstance(edges, pd.DataFrame):
+        df = edges
+        rows = list(df.itertuples(index=False, name='Edge'))
+        def out_id(r): return str(getattr(r, 'source')).strip()
+        def in_id(r): return str(getattr(r, 'target')).strip()
+        def lbl(r):
+            val = getattr(r, 'edge_detail') if hasattr(r, 'edge_detail') else None
+            return val if pd.notna(val) else 'connects'
+        prop_cols = [c for c in df.columns if c not in ('source','target','edge_detail')]
+        def props(r): return {c: getattr(r, c) for c in prop_cols if pd.notna(getattr(r, c))}
+    else:
+        rows = list(edges)
+        def out_id(r): return r['out']
+        def in_id(r): return r['in']
+        def lbl(r): return r['label']
+        def props(r): return r.get('props', {})
+
+    # Filter new edges
+    to_upload = []
+    for r in rows:
+        key = f"{out_id(r)}_{lbl(r)}_{in_id(r)}"
+        if key not in inserted_edge_keys:
+            to_upload.append((r, key))
+    total = len(to_upload)
+
+    label = HTML()
+    bar = IntProgress(min=0, max=total, description="Edges:")
+    display(VBox([label, bar]))
+
+    uploaded = 0
+    lock = threading.Lock()
+    start = time.time()
+
+    def _upload_batch(batch):
+        nonlocal uploaded
+        count = 0
+        statements = []
+        keys = []
+        for r, key in batch:
+            outv, inv, lblv = out_id(r), in_id(r), lbl(r)
+            stmt = f"g.V('{outv}').addE('{lblv}').to(g.V('{inv}')).property('id','{key}')"
+            for k, v in props(r).items():
+                stmt += f".property('{k}','{v}')"
+            statements.append(stmt)
+            keys.append(key)
+
+        script = "; ".join(statements)
+        for attempt in range(max_retries):
+            try:
+                rs = client.submit(script, request_options={'pageSize': len(statements)})
+                rs.all().result()
+                throttler.throttle(float(rs.status_attributes.get('x-ms-total-request-charge', 10.0)))
+                count = len(statements)
+                break
+            except GremlinServerError as e:
+                msg = str(e)
+                if '429' in msg or 'GraphTimeoutException' in msg:
+                    time.sleep(backoff_base * (2 ** attempt))
+                    continue
+                else:
+                    print(f"Edge upload failed for {keys[:3]}: {e}")
+                    break
+
+        with lock:
+            for k in keys[:count]:
+                inserted_edge_keys.add(k)
+            uploaded += count
+            bar.value = uploaded
+            elapsed = time.time() - start
+            rate = uploaded / elapsed if elapsed else 0
+            eta = (total - uploaded) / rate if rate else float('inf')
+            label.value = f"Uploaded {uploaded}/{total} edges, Elapsed {elapsed:.1f}s, ETA {eta:.1f}s"
+        return count
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_upload_batch, list(chunk)) for chunk in chunked(to_upload, batch_size)]
+        for _ in as_completed(futures):
+            pass
+
+    return inserted_edge_keys
