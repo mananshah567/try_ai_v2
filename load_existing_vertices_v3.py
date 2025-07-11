@@ -13,13 +13,14 @@ def load_existing_vertices_by_keyset(
     backoff_base: float = 1.0
 ) -> set:
     """
-    Load all vertex IDs using keyset (id > lastId) pagination.
-    Avoids ever scanning from the start, so RU per page stays flat.
+    Load all vertex IDs by keyset pagination on 'graph_id', which you always set = id.
+    This ensures each batch is the next slice in sorted order.
     """
-    # try to size the bar
+    # 1) Try to size the progress bar
     try:
-        total = client.submit("g.V().count()", {}, request_options={"pageSize":1}) \
-                      .all().result()[0]
+        total = client.submit(
+            "g.V().count()", {}, request_options={"pageSize": 1}
+        ).all().result()[0]
         bar = IntProgress(min=0, max=total, description="Vertices:")
     except Exception:
         total = None
@@ -27,22 +28,29 @@ def load_existing_vertices_by_keyset(
     label = HTML(); display(VBox([label, bar]))
 
     inserted = set()
-    last_id = None
+    last_graph_id = None
     loaded = 0
     start = time.time()
 
     while True:
-        # build the traversal
-        if last_id is None:
-            gremlin = f"g.V().limit({batch_size}).id()"
+        # 2) Build ordered query
+        if last_graph_id is None:
+            gremlin = (
+                f"g.V()"
+                f".order().by('graph_id')"        # ensure sorted
+                f".limit({batch_size})"
+                f".values('graph_id')"            # return your id-property
+            )
         else:
             gremlin = (
-                f\"g.V().has('id', P.gt('{last_id}'))\"
-                f\".order().by(id, asc)\"
-                f\".limit({batch_size}).id()\" 
+                f"g.V()"
+                f".has('graph_id', P.gt('{last_graph_id}'))"
+                f".order().by('graph_id')"
+                f".limit({batch_size})"
+                f".values('graph_id')"
             )
 
-        # retry loop
+        # 3) Retry fetch on 429/timeout
         for attempt in range(max_retries):
             try:
                 rs = client.submit(
@@ -61,17 +69,17 @@ def load_existing_vertices_by_keyset(
                 else:
                     raise
         else:
-            print("❌  Failed to fetch after retries; aborting.")
+            print("❌ Failed to fetch batch after retries; aborting.")
             break
 
         if not ids:
-            # done!
+            # we've paged through everything
             break
 
-        # record progress
+        # 4) Record & display progress
         inserted.update(ids)
         loaded += len(ids)
-        last_id = ids[-1]
+        last_graph_id = ids[-1]
         bar.value = loaded
 
         elapsed = time.time() - start
