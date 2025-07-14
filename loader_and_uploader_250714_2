@@ -1,0 +1,225 @@
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import islice
+from gremlin_python.driver.client import Client
+from gremlin_python.driver.protocol import GremlinServerError
+from gremlin_python.process.traversal import P
+from ipywidgets import IntProgress, HTML, VBox
+from IPython.display import display
+import pandas as pd
+
+# Utility: chunk an iterable into lists of size `size`
+def chunked(iterable, size):
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, size))
+        if not batch:
+            return
+        yield batch
+
+# Utility: safe string extraction
+def _safe(val):
+    import pandas as _pd
+    if val is None:
+        return ''
+    try:
+        if isinstance(val, float) and _pd.isna(val):
+            return ''
+    except:
+        pass
+    s = str(val).strip()
+    return s if s else ''
+
+
+def load_existing_vertices_by_keyset(
+    client: Client,
+    throttler,
+    batch_size: int = 1000,
+    max_retries: int = 3,
+    backoff_base: float = 1.0
+) -> set:
+    """
+    Load all vertices by keyset pagination on 'graph_id', returning composite keys:
+    "id|Label|entity_type|entity_category".
+    Single-traversal approach projecting cursor and properties in one go.
+    """
+    # attempt to size the progress bar
+    try:
+        total = client.submit(
+            "g.V().count()", {}, request_options={"pageSize": 1}
+        ).all().result()[0]
+        bar = IntProgress(min=0, max=total, description="Vertices:")
+    except Exception as e:
+        print(f"Could not retrieve total count: {e}")
+        total = None
+        bar = IntProgress(min=0, description="Vertices:")
+    label = HTML(); display(VBox([label, bar]))
+
+    inserted = set()
+    last_gid = None
+    loaded = 0
+    start = time.time()
+
+    # define projection for cursor + properties
+    proj = (
+        ".project('cursor','id','label','entity_type','entity_category')"
+        ".by(values('graph_id'))"
+        ".by(id())"
+        ".by(label())"
+        ".by(values('entity_type').fold().coalesce(unfold(),constant('')))"
+        ".by(values('entity_category').fold().coalesce(unfold(),constant('')))"
+    )
+
+    while True:
+        # build single-traversal keyset-paging query
+        if last_gid is None:
+            gremlin = (
+                f"g.V().order().by('graph_id').limit({batch_size})" + proj
+            )
+        else:
+            gremlin = (
+                f"g.V().has('graph_id', P.gt('{last_gid}')).order().by('graph_id')"
+                f".limit({batch_size})" + proj
+            )
+        # fetch page with retry/backoff
+        for attempt in range(max_retries):
+            try:
+                rs = client.submit(gremlin, request_options={"pageSize": batch_size})
+                batch = rs.all().result()
+                throttler.throttle(float(rs.status_attributes.get('x-ms-total-request-charge', 10.0)))
+                break
+            except GremlinServerError as e:
+                print(f"Fetch attempt {attempt+1} failed for [{gremlin}]: {e}")
+                if '429' in str(e) or 'GraphTimeoutException' in str(e):
+                    time.sleep(backoff_base * (2 ** attempt))
+                    continue
+                else:
+                    raise
+        else:
+            print("❌ Exhausted fetch retries; aborting loader.")
+            break
+
+        if not batch:
+            # end of data
+            break
+
+        # process returned items
+        for item in batch:
+            try:
+                cursor = _safe(item['cursor'])
+                key = '|'.join(_safe(item[k]) for k in ['id','label','entity_type','entity_category'])
+                inserted.add(key)
+            except Exception as e:
+                print(f"Processing error for item {item}: {e}")
+        # advance cursor using last returned 'cursor'
+        last_gid = _safe(batch[-1]['cursor'])
+        loaded += len(batch)
+
+        # update progress
+        bar.value = loaded
+        elapsed = time.time() - start
+        rate = loaded / elapsed if elapsed else 0
+        eta = (total - loaded) / rate if (total and rate) else float('inf')
+        label.value = f"Loaded {loaded}{'/' + str(total) if total else ''} · ETA {eta:.1f}s"
+
+    return inserted
+
+
+def parallel_upload_vertices(
+    client: Client,
+    throttler,
+    vertices,
+    inserted_keys: set,
+    dispatcher: dict,
+    batch_size: int = 100,
+    workers: int = 4,
+    max_retries: int = 3,
+    backoff_base: float = 1.0
+) -> set:
+    """
+    Fully optimized parallel vertex uploader with detailed error handling.
+    """
+    # normalize input rows
+    if isinstance(vertices, pd.DataFrame):
+        rows = list(vertices.itertuples(index=False, name='Row'))
+    else:
+        rows = list(vertices)
+
+    # extractor for composite key fields
+    def extract(r):
+        if hasattr(r, '_fields'):
+            d = r._asdict()
+        else:
+            d = r
+        idv = _safe(d.get('ID') or d.get('id'))
+        lb  = _safe(d.get('Label') or d.get('label'))
+        et  = _safe(d.get('entity_type'))
+        ec  = _safe(d.get('entity_category'))
+        return idv, lb, et, ec
+
+    # build tasks
+    tasks = []
+    for r in rows:
+        idv, lb, et, ec = extract(r)
+        key = f"{idv}|{lb}|{et}|{ec}"
+        if key and key not in inserted_keys:
+            tasks.append((r, key))
+    total = len(tasks)
+
+    # progress UI
+    label = HTML()
+    bar = IntProgress(min=0, max=total, description='Vertices:')
+    display(VBox([label, bar]))
+
+    uploaded = 0
+    lock = threading.Lock()
+    start = time.time()
+
+    def _upload_batch(batch):
+        local_success = []
+        for r, key in batch:
+            idv, lb, et, ec = extract(r)
+            q = (f"g.addV('{lb}')"
+                 f".property('id','{idv}')"
+                 f".property('graph_id','{idv}')"
+                 f".property('entity_type','{et}')"
+                 f".property('entity_category','{ec}')")
+            # apply dispatcher
+            row_obj = r._asdict() if hasattr(r, '_asdict') else r
+            q = dispatcher.get(lb, lambda row, qq: qq)(row_obj, q)
+            # retry/backoff
+            for attempt in range(max_retries):
+                try:
+                    rs = client.submit(q)
+                    rs.all().result()
+                    ru = float(rs.status_attributes.get('x-ms-total-request-charge', 10.0))
+                    throttler.throttle(ru)
+                    local_success.append(key)
+                    break
+                except GremlinServerError as e:
+                    print(f"Attempt {attempt+1} failed for {key}: {e} (query: {q})")
+                    if '429' in str(e) or 'GraphTimeoutException' in str(e):
+                        time.sleep(backoff_base * (2 ** attempt))
+                    else:
+                        break
+                except Exception as e:
+                    print(f"Unexpected error for {key}: {e} (query: {q})")
+                    break
+        return local_success
+
+    # parallel execution
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_upload_batch, b) for b in chunked(tasks, batch_size)]
+        for future in as_completed(futures):
+            success_keys = future.result()
+            with lock:
+                inserted_keys.update(success_keys)
+                uploaded += len(success_keys)
+                bar.value = uploaded
+                elapsed = time.time() - start
+                rate = uploaded / elapsed if elapsed else 0
+                eta = (total-uploaded)/rate if rate else float('inf')
+                label.value = f"Uploaded {uploaded}/{total} vertices · ETA {eta:.1f}s"
+
+    return inserted_keys
