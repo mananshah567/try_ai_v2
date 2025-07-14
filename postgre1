@@ -1,0 +1,14 @@
+WITH numbered AS (
+  SELECT
+    *,
+    LEFT(id, 1) AS prefix,
+    ROW_NUMBER() OVER (
+      PARTITION BY LEFT(id,1)
+      ORDER BY id             -- or replace with whatever ordering you need
+    ) AS rn
+  FROM your_table
+  WHERE LEFT(id,1) = ANY (ARRAY['p','c','e','f','h','r','g']::text[])
+)
+SELECT *
+FROM numbered
+WHERE rn <= 50;
