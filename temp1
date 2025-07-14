@@ -1,0 +1,142 @@
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import islice
+from gremlin_python.driver.client import Client
+from gremlin_python.driver.protocol import GremlinServerError
+from ipywidgets import IntProgress, HTML, VBox
+from IPython.display import display
+import pandas as pd
+
+# Utility: chunk an iterable into lists of size `size`
+def chunked(iterable, size):
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, size))
+        if not batch:
+            return
+        yield batch
+
+# Utility: safe string extraction
+def _safe(val):
+    import pandas as _pd
+    if val is None:
+        return ''
+    try:
+        if isinstance(val, float) and _pd.isna(val):
+            return ''
+    except:
+        pass
+    s = str(val).strip()
+    return s if s else ''
+
+
+def parallel_upload_vertices(
+    client: Client,
+    throttler,
+    vertices,
+    inserted_keys: set,
+    dispatcher: dict,
+    batch_size: int = 100,
+    workers: int = 4,
+    max_retries: int = 3,
+    backoff_base: float = 1.0
+) -> set:
+    """
+    Fully optimized parallel vertex uploader:
+    - Accepts pandas.DataFrame or list of dicts
+    - Extracts fields: ID, Label, entity_type, entity_category
+    - Forms composite key 'ID|Label|entity_type|entity_category'
+    - Filters against inserted_keys
+    - Uploads in batches of batch_size in parallel threads
+    - Adds properties: id, graph_id, entity_type, entity_category, plus dispatcher extras
+    - Retries on 429/GraphTimeoutException with exponential backoff
+    - Throttles on RU consumption
+    - Shows progress bar with ETA
+    """
+    # Normalize rows
+    if isinstance(vertices, pd.DataFrame):
+        rows = list(vertices.itertuples(index=False, name='Row'))
+    else:
+        rows = list(vertices)
+
+    # Extractor for all required fields
+    def extract(r):
+        if hasattr(r, '_fields'):
+            idv = _safe(getattr(r, 'ID', None))
+            lb  = _safe(getattr(r, 'Label', None))
+            et  = _safe(getattr(r, 'entity_type', None))
+            ec  = _safe(getattr(r, 'entity_category', None))
+        else:
+            idv = _safe(r.get('id'))
+            lb  = _safe(r.get('label'))
+            et  = _safe(r.get('entity_type'))
+            ec  = _safe(r.get('entity_category'))
+        return idv, lb, et, ec
+
+    # Build task list of (row, composite_key)
+    tasks = []
+    for r in rows:
+        idv, lb, et, ec = extract(r)
+        key = f"{idv}|{lb}|{et}|{ec}"
+        if key and key not in inserted_keys:
+            tasks.append((r, key))
+    total = len(tasks)
+
+    # Progress UI
+    label = HTML()
+    bar = IntProgress(min=0, max=total, description="Vertices:")
+    display(VBox([label, bar]))
+
+    uploaded = 0
+    lock = threading.Lock()
+    start = time.time()
+
+    def _upload_batch(batch):
+        local_count = 0
+        for r, key in batch:
+            idv, lb, et, ec = extract(r)
+            # Construct base Gremlin query with required properties
+            q = (
+                f"g.addV('{lb}')"
+                f".property('id','{idv}')"
+                f".property('graph_id','{idv}')"
+                f".property('entity_type','{et}')"
+                f".property('entity_category','{ec}')"
+            )
+            # Apply dispatcher for additional props
+            q = dispatcher.get(lb, lambda row, qq: qq)(r, q)
+            # Retry/backoff logic
+            for attempt in range(max_retries):
+                try:
+                    rs = client.submit(q)
+                    rs.all().result()
+                    ru = float(rs.status_attributes.get('x-ms-total-request-charge', 10.0))
+                    throttler.throttle(ru)
+                    local_count += 1
+                    break
+                except GremlinServerError as e:
+                    msg = str(e)
+                    if '429' in msg or 'GraphTimeoutException' in msg:
+                        time.sleep(backoff_base * (2 ** attempt))
+                        continue
+                    else:
+                        print(f"Upload failed for {key}: {e}")
+                        break
+        return local_count
+
+    # Dispatch batches in parallel
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_upload_batch, batch)
+                   for batch in chunked(tasks, batch_size)]
+        for f in as_completed(futures):
+            count = f.result()
+            with lock:
+                uploaded += count
+                bar.value = uploaded
+                elapsed = time.time() - start
+                rate = uploaded / elapsed if elapsed else 0
+                eta = (total - uploaded) / rate if rate else float('inf')
+                label.value = f"Uploaded {uploaded}/{total} vertices · ETA {eta:.1f}s"
+
+    return inserted_keys
