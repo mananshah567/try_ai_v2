@@ -31,7 +31,6 @@ def _safe(val):
     s = str(val).strip()
     return s if s else ''
 
-
 def load_existing_vertices_by_keyset(
     client: Client,
     throttler,
@@ -63,7 +62,7 @@ def load_existing_vertices_by_keyset(
 
     # define projection for cursor + properties
     proj = (
-        ".project('cursor','id','label','entity_type','entity_category')"
+        ".project('graph_id','id','label','entity_type','entity_category')"
         ".by(values('graph_id'))"
         ".by(id())"
         ".by(label())"
@@ -107,7 +106,7 @@ def load_existing_vertices_by_keyset(
         # process returned items
         for item in batch:
             try:
-                cursor = _safe(item['cursor'])
+                cursor = _safe(item['graph_id'])
                 key = '|'.join(_safe(item[k]) for k in ['id','label','entity_type','entity_category'])
                 inserted.add(key)
             except Exception as e:
