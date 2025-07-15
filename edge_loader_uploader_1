@@ -42,7 +42,7 @@ def load_existing_edges_by_keyset(
     """
     Load all edges by keyset pagination on 'id', returning composite keys:
     "out|label|in".
-    Single-traversal projection of cursor + endpoints.
+    Single-traversal projection of cursor (edge id) + endpoints.
     """
     # progress bar setup
     try:
@@ -59,9 +59,9 @@ def load_existing_edges_by_keyset(
     loaded = 0
     start = time.time()
 
-    # projection for cursor and edge endpoints
+    # projection for edge id and endpoints
     proj = (
-        ".project('cursor','out','label','in')"
+        ".project('id','out','label','in')"
         ".by(id())"
         ".by(outV().id())"
         ".by(label())"
@@ -108,8 +108,8 @@ def load_existing_edges_by_keyset(
                 inserted.add(key)
             except Exception as e:
                 print(f"Error processing edge item {item}: {e}")
-        # advance cursor
-        last_id = _safe(batch[-1]['cursor'])
+        # advance cursor to last edge id
+        last_id = _safe(batch[-1]['id'])
         loaded += len(batch)
 
         # update progress
