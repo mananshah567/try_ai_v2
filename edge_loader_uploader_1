@@ -1,0 +1,229 @@
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import islice
+from gremlin_python.driver.client import Client
+from gremlin_python.driver.protocol import GremlinServerError
+from gremlin_python.process.traversal import P
+from ipywidgets import IntProgress, HTML, VBox
+from IPython.display import display
+import pandas as pd
+
+# Utility: chunk an iterable into lists of size `size`
+def chunked(iterable, size):
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, size))
+        if not batch:
+            return
+        yield batch
+
+# Utility: safe string extraction
+def _safe(val):
+    import pandas as _pd
+    if val is None:
+        return ''
+    try:
+        if isinstance(val, float) and _pd.isna(val):
+            return ''
+    except:
+        pass
+    s = str(val).strip()
+    return s if s else ''
+
+
+def load_existing_edges_by_keyset(
+    client: Client,
+    throttler,
+    batch_size: int = 1000,
+    max_retries: int = 3,
+    backoff_base: float = 1.0
+) -> set:
+    """
+    Load all edges by keyset pagination on 'id', returning composite keys:
+    "out|label|in".
+    Single-traversal projection of cursor + endpoints.
+    """
+    # progress bar setup
+    try:
+        total = client.submit("g.E().count()", {}, request_options={"pageSize": 1}).all().result()[0]
+        bar = IntProgress(min=0, max=total, description="Edges:")
+    except Exception as e:
+        print(f"Could not retrieve total count: {e}")
+        total = None
+        bar = IntProgress(min=0, description="Edges:")
+    label = HTML(); display(VBox([label, bar]))
+
+    inserted = set()
+    last_id = None
+    loaded = 0
+    start = time.time()
+
+    # projection for cursor and edge endpoints
+    proj = (
+        ".project('cursor','out','label','in')"
+        ".by(id())"
+        ".by(outV().id())"
+        ".by(label())"
+        ".by(inV().id())"
+    )
+
+    while True:
+        # build keyset query
+        if last_id is None:
+            gremlin = f"g.E().order().by('id').limit({batch_size})" + proj
+        else:
+            gremlin = (
+                f"g.E().has('id', P.gt('{last_id}')).order().by('id')"
+                f".limit({batch_size})" + proj
+            )
+        # fetch page of edges
+        for attempt in range(max_retries):
+            try:
+                rs = client.submit(gremlin, request_options={"pageSize": batch_size})
+                batch = rs.all().result()
+                throttler.throttle(float(rs.status_attributes.get('x-ms-total-request-charge', 10.0)))
+                break
+            except GremlinServerError as e:
+                print(f"Fetch attempt {attempt+1} failed [{gremlin}]: {e}")
+                if '429' in str(e) or 'GraphTimeoutException' in str(e):
+                    time.sleep(backoff_base * (2 ** attempt))
+                    continue
+                else:
+                    raise
+        else:
+            print("❌ Exhausted fetch retries; aborting edge loader.")
+            break
+
+        if not batch:
+            break
+
+        # process items
+        for item in batch:
+            try:
+                out = _safe(item['out'])
+                lbl = _safe(item['label'])
+                inv = _safe(item['in'])
+                key = f"{out}|{lbl}|{inv}"
+                inserted.add(key)
+            except Exception as e:
+                print(f"Error processing edge item {item}: {e}")
+        # advance cursor
+        last_id = _safe(batch[-1]['cursor'])
+        loaded += len(batch)
+
+        # update progress
+        bar.value = loaded
+        elapsed = time.time() - start
+        rate = loaded / elapsed if elapsed else 0
+        eta = (total - loaded) / rate if (total and rate) else float('inf')
+        label.value = f"Loaded {loaded}{'/' + str(total) if total else ''} · ETA {eta:.1f}s"
+
+    return inserted
+
+
+def parallel_upload_edges(
+    client: Client,
+    throttler,
+    edges,
+    inserted_keys: set,
+    dispatcher: dict = None,
+    batch_size: int = 100,
+    workers: int = 4,
+    max_retries: int = 3,
+    backoff_base: float = 1.0
+) -> set:
+    """
+    Parallel upload of new edges with composite keys 'out|label|in':
+    - Accepts pandas.DataFrame or list of dicts
+    - Extracts out, label, in, optional props
+    - Filters by inserted_keys
+    - Dispatches batches in parallel with retry/backoff, throttling
+    - Shows progress + ETA
+    """
+    # normalize input rows
+    if isinstance(edges, pd.DataFrame):
+        rows = list(edges.itertuples(index=False, name='Edge'))
+    else:
+        rows = list(edges)
+
+    # extractor
+    def extract(r):
+        if hasattr(r, '_fields'):
+            d = r._asdict()
+            out = _safe(d.get('out'))
+            lbl = _safe(d.get('label'))
+            inv = _safe(d.get('in'))
+            props = {k: _safe(v) for k, v in d.items() if k not in ('out','in','label')}
+        else:
+            out = _safe(r.get('out'))
+            lbl = _safe(r.get('label'))
+            inv = _safe(r.get('in'))
+            props = {k: _safe(v) for k, v in r.items() if k not in ('out','in','label')}
+        return out, lbl, inv, props
+
+    # build tasks
+    tasks = []
+    for r in rows:
+        out, lbl, inv, props = extract(r)
+        key = f"{out}|{lbl}|{inv}"
+        if key and key not in inserted_keys:
+            tasks.append((r, key))
+    total = len(tasks)
+
+    # progress UI
+    label = HTML()
+    bar = IntProgress(min=0, max=total, description="Edges:")
+    display(VBox([label, bar]))
+
+    uploaded = 0
+    lock = threading.Lock()
+    start = time.time()
+
+    def _upload_batch(batch):
+        local_success = []
+        for r, key in batch:
+            out, lbl, inv, props = extract(r)
+            # base Gremlin
+            q = (
+                f"g.V('{out}').addE('{lbl}').to(g.V('{inv}'))"
+                f".property('id','{key}')"
+            )
+            # add props
+            for k, v in props.items():
+                q += f".property('{k}','{v}')"
+            # dispatcher hook
+            if dispatcher:
+                row_obj = r._asdict() if hasattr(r, '_asdict') else r
+                q = dispatcher.get(lbl, lambda row, qq: qq)(row_obj, q)
+            # retry logic
+            for attempt in range(max_retries):
+                try:
+                    rs = client.submit(q, request_options={'pageSize':1})
+                    rs.all().result()
+                    throttler.throttle(float(rs.status_attributes.get('x-ms-total-request-charge',10.0)))
+                    local_success.append(key)
+                    break
+                except GremlinServerError as e:
+                    print(f"Attempt {attempt+1} failed for edge {key}: {e}")
+                    if '429' in str(e) or 'GraphTimeoutException' in str(e):
+                        time.sleep(backoff_base * (2 ** attempt))
+                    else:
+                        break
+        return local_success
+
+    # execute in parallel
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_upload_batch, b) for b in chunked(tasks, batch_size)]
+        for future in as_completed(futures):
+            keys = future.result()
+            with lock:
+                inserted_keys.update(keys)
+                uploaded += len(keys)
+                bar.value = uploaded
+                elapsed = time.time() - start
+                rate = uploaded / elapsed if elapsed else 0
+                eta = (total-uploaded)/rate if rate else float('inf')
+                label.value = f"Uploaded {uploaded}/{total} edges · ETA {eta:.1f}s"
+
+    return inserted_keys
