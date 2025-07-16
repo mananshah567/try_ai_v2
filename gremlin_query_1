@@ -1,0 +1,9 @@
+g.V('START_ID').as('src')
+  // 1st hop: any edge out or in
+  .bothE().as('e1')
+  .otherV().as('mid')
+  // 2nd hop: again any edge out or in from each mid
+  .bothE().as('e2')
+  .otherV().as('dst')
+  // return all 5 elements
+  .select('src','e1','mid','e2','dst')
