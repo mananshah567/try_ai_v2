@@ -1,0 +1,11 @@
+az cosmosdb gremlin graph throughput update \
+  --account-name prosprosdb-dev \
+  --database-name prospecting_v1 \
+  --name graph-v1 \
+  --throughput 5000
+
+
+az role assignment list \
+  --assignee <your-email> \
+  --all \
+  --output table
