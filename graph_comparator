@@ -1,0 +1,81 @@
+import pandas as pd
+from decimal import Decimal, InvalidOperation
+
+def _safe_str(v):
+    if v is None: return ''
+    s = str(v).strip()
+    return '' if s.lower() in ('nan','none') else s
+
+def _iter_rows(df_or_rows):
+    return df_or_rows.itertuples(index=False, name='Row') if isinstance(df_or_rows, pd.DataFrame) else df_or_rows
+
+# ---------- Vertex (ID-only) ----------
+
+def vertex_id_builder(row):
+    d = row._asdict() if hasattr(row, '_asdict') else row
+    return _safe_str(d.get('ID') or d.get('id'))
+
+def vertex_diffs_by_id(df_vertices, existing_vertex_ids: set):
+    """
+    Returns dict with:
+      - to_upload: IDs present in DF, missing in graph
+      - to_delete: IDs present in graph, missing in DF
+      - in_both:   IDs present in both
+    """
+    want = { vid for r in _iter_rows(df_vertices) if (vid := vertex_id_builder(r)) }
+    existing = set(existing_vertex_ids)
+    return {
+        'to_upload': want - existing,
+        'to_delete': existing - want,
+        'in_both':   want & existing,
+    }
+
+# ---------- Edge (edge-id is "source|weight|target") ----------
+
+def _norm_weight(w):
+    """Normalize weight to a stable string so DF and graph match exactly."""
+    s = _safe_str(w)
+    if s == '':
+        return ''
+    # If numeric, normalize (e.g., 1.0 -> "1", 1.2300 -> "1.23")
+    try:
+        d = Decimal(s)
+        # remove trailing zeros and possible trailing dot
+        s = format(d.normalize(), 'f').rstrip('0').rstrip('.')
+        return s if s != '' else '0'
+    except (InvalidOperation, ValueError):
+        return s  # non-numeric strings left as-is
+
+def edge_id_builder_source_weight_target(row):
+    d = row._asdict() if hasattr(row, '_asdict') else row
+    out = _safe_str(d.get('out') or d.get('source') or d.get('src'))
+    inv = _safe_str(d.get('in')  or d.get('target') or d.get('dst'))
+    w   = _norm_weight(d.get('weight'))
+    return f"{out}|{w}|{inv}"
+
+def edge_diffs_by_edge_id(df_edges, existing_edge_ids: set):
+    """
+    Returns dict with:
+      - to_upload: edge IDs present in DF, missing in graph
+      - to_delete: edge IDs present in graph, missing in DF
+      - in_both:   edge IDs present in both
+    """
+    want = { eid for r in _iter_rows(df_edges) if (eid := edge_id_builder_source_weight_target(r)) }
+    existing = set(existing_edge_ids)
+    return {
+        'to_upload': want - existing,
+        'to_delete': existing - want,
+        'in_both':   want & existing,
+    }
+
+# Vertices: graph set is from your loader (load_existing_vertices -> set of IDs)
+v_diffs = vertex_diffs_by_id(df_vertices, existing_vertex_ids)
+to_upload_vertex_ids = v_diffs['to_upload']
+to_delete_vertex_ids = v_diffs['to_delete']
+
+# Edges: graph set is from your edge-ID loader (e.g., load_existing_edges -> set of IDs)
+e_diffs = edge_diffs_by_edge_id(df_edges, existing_edge_ids)
+to_upload_edge_ids = e_diffs['to_upload']
+to_delete_edge_ids = e_diffs['to_delete']
+
+
