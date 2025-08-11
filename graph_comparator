@@ -11,62 +11,43 @@ def _iter_rows(df_or_rows):
 
 # ---------- Vertex (ID-only) ----------
 
-def vertex_id_builder(row):
-    d = row._asdict() if hasattr(row, '_asdict') else row
-    return _safe_str(d.get('ID') or d.get('id'))
+# vertex IDs from DF
+ids_df = (
+    df_vertices['ID']
+      .astype('string')      # pandas nullable string dtype (keeps <NA>)
+      .str.strip()
+      .dropna()
+)
+want_vertex_ids = set(ids_df[ids_df.ne('')])
 
-def vertex_diffs_by_id(df_vertices, existing_vertex_ids: set):
-    """
-    Returns dict with:
-      - to_upload: IDs present in DF, missing in graph
-      - to_delete: IDs present in graph, missing in DF
-      - in_both:   IDs present in both
-    """
-    want = { vid for r in _iter_rows(df_vertices) if (vid := vertex_id_builder(r)) }
-    existing = set(existing_vertex_ids)
-    return {
-        'to_upload': want - existing,
-        'to_delete': existing - want,
-        'in_both':   want & existing,
-    }
+# diffs vs graph
+existing_vertex_ids = set(existing_vertex_ids)  # from your loader
+to_upload_vertices = want_vertex_ids - existing_vertex_ids
+to_delete_vertices = existing_vertex_ids - want_vertex_ids
+
 
 # ---------- Edge (edge-id is "source|weight|target") ----------
-
-def _norm_weight(w):
-    """Normalize weight to a stable string so DF and graph match exactly."""
-    s = _safe_str(w)
-    if s == '':
-        return ''
-    # If numeric, normalize (e.g., 1.0 -> "1", 1.2300 -> "1.23")
+def normalize_weight(s):
+    # optional: ensure weight string is stable across sources
+    from decimal import Decimal, InvalidOperation
+    s = str(s).strip()
     try:
-        d = Decimal(s)
-        # remove trailing zeros and possible trailing dot
-        s = format(d.normalize(), 'f').rstrip('0').rstrip('.')
-        return s if s != '' else '0'
+        return format(Decimal(s).normalize(), 'f').rstrip('0').rstrip('.') or '0'
     except (InvalidOperation, ValueError):
-        return s  # non-numeric strings left as-is
+        return s
 
-def edge_id_builder_source_weight_target(row):
-    d = row._asdict() if hasattr(row, '_asdict') else row
-    out = _safe_str(d.get('out') or d.get('source') or d.get('src'))
-    inv = _safe_str(d.get('in')  or d.get('target') or d.get('dst'))
-    w   = _norm_weight(d.get('weight'))
-    return f"{out}|{w}|{inv}"
+edge_ids_df = (
+    df_edges
+      .assign(
+          _out=df_edges['out'].astype('string').str.strip(),
+          _in=df_edges['in'].astype('string').str.strip(),
+          _w=df_edges['weight'].map(normalize_weight).astype('string').str.strip()
+      )
+      .eval("edge_id = _out + '|' + _w + '|' + _in")['edge_id']
+      .astype('string').str.strip().dropna()
+)
+want_edge_ids = set(edge_ids_df[edge_ids_df.ne('')])
 
-def edge_diffs_by_edge_id(df_edges, existing_edge_ids: set):
-    """
-    Returns dict with:
-      - to_upload: edge IDs present in DF, missing in graph
-      - to_delete: edge IDs present in graph, missing in DF
-      - in_both:   edge IDs present in both
-    """
-    want = { eid for r in _iter_rows(df_edges) if (eid := edge_id_builder_source_weight_target(r)) }
-    existing = set(existing_edge_ids)
-    return {
-        'to_upload': want - existing,
-        'to_delete': existing - want,
-        'in_both':   want & existing,
-    }
 
 # Vertices: graph set is from your loader (load_existing_vertices -> set of IDs)
 v_diffs = vertex_diffs_by_id(df_vertices, existing_vertex_ids)
