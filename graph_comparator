@@ -34,17 +34,17 @@ def normalize_weight(s):
     except (InvalidOperation, ValueError):
         return s
 
-edge_ids_df = (
-    df_edges
-      .assign(
-          _out=df_edges['out'].astype('string').str.strip(),
-          _in=df_edges['in'].astype('string').str.strip(),
-          _w=df_edges['weight'].map(normalize_weight).astype('string').str.strip()
-      )
-      .eval("edge_id = _out + '|' + _w + '|' + _in")['edge_id']
-      .astype('string').str.strip().dropna()
+tmp = df_edges.assign(
+    _out=df_edges['out'].astype('string').str.strip(),
+    _in =df_edges['in'].astype('string').str.strip(),
+    _w  =df_edges['weight'].map(normalize_weight).astype('string').str.strip()
 )
-want_edge_ids = set(edge_ids_df[edge_ids_df.ne('')])
+
+edge_ids = tmp['_out'].str.cat(tmp['_w'], sep='|').str.cat(tmp['_in'], sep='|')
+edge_ids = edge_ids.astype('string').str.strip()
+edge_ids = edge_ids[edge_ids.ne('')].dropna()
+
+want_edge_ids = set(edge_ids)
 
 existing_edge_ids = set(existing_edge_ids)      # from your edge loader
 to_upload_edges = want_edge_ids - existing_edge_ids
