@@ -25,15 +25,24 @@ existing_vertex_ids = set(existing_vertex_ids)  # from your loader
 to_upload_vertices = want_vertex_ids - existing_vertex_ids
 to_delete_vertices = existing_vertex_ids - want_vertex_ids
 
+def normalize_weight(s):
+    # optional: ensure weight string is stable across sources
+    from decimal import Decimal, InvalidOperation
+    s = str(s).strip()
+    try:
+        return format(Decimal(s).normalize(), 'f').rstrip('0').rstrip('.') or '0'
+    except (InvalidOperation, ValueError):
+        return s
 
 edge_ids_df = (
-    df_edges['edge_id']      # or whatever the column is called
-      .astype('string')
-      .str.strip()
-      .dropna()
+    df_edges
+      .assign(
+          _out=df_edges['out'].astype('string').str.strip(),
+          _in=df_edges['in'].astype('string').str.strip(),
+          _w=df_edges['weight'].map(normalize_weight).astype('string').str.strip()
+      )
+      .eval("edge_id = _out + '|' + _w + '|' + _in")['edge_id']
+      .astype('string').str.strip().dropna()
 )
 want_edge_ids = set(edge_ids_df[edge_ids_df.ne('')])
 
-existing_edge_ids = set(existing_edge_ids)      # from your edge loader
-to_upload_edges = want_edge_ids - existing_edge_ids
-to_delete_edges = existing_edge_ids - want_edge_ids
