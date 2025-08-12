@@ -46,3 +46,7 @@ edge_ids_df = (
 )
 want_edge_ids = set(edge_ids_df[edge_ids_df.ne('')])
 
+existing_edge_ids = set(existing_edge_ids)      # from your edge loader
+to_upload_edges = want_edge_ids - existing_edge_ids
+to_delete_edges = existing_edge_ids - want_edge_ids
+
